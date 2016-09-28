@@ -37,7 +37,6 @@ from ansible import utils
 
 
 def retry(func):
-    print ("Starting %s" % func.__name__)
     def retry_exec(self, *args, **kwargs):
         """ Wrapper around exec_command, put_file or fetch_file to retry in the case of an ssh
             failure
@@ -47,9 +46,9 @@ def retry(func):
             * ssh returns 255
         """
         cmd_summary = "%s %s..." % (args[0], str(kwargs)[:200])
-        remaining_tries = C.ANSIBLE_SSH_RETRIES+1
+        remaining_tries = C.ANSIBLE_SSH_RETRIES
         for attempt in xrange(1, remaining_tries+1):
-            pause = 2 ** attempt - 1
+            pause = 2 ** (attempt - 1)
 
             if pause > 30:
                 pause = 30
@@ -64,16 +63,15 @@ def retry(func):
                 if return_tuple[0] != 255:
                     break
                 else:
-                    msg = ('[WARNING] ssh_retry [%s/%s]: ssh return code is 255. cmd (%s)' %
-                           (attempt, remaining_tries, cmd_summary))
+                    msg = ('[WARNING] ssh_retry [%s]: ssh return code is 255. cmd (%s)' %
+                           (attempt, cmd_summary))
 
             except (errors.AnsibleConnectionFailed, errors.AnsibleConnectionTimeout, Exception) as e:
-                msg = ("[WARNING] ssh_retry [%s/%s]: Caught %s (%s) from cmd (%s)." %
-                       (attempt, remaining_tries, type(e).__name__, e.message, cmd_summary))
+                msg = ("[WARNING] ssh_retry [%s]: Caught %s (%s) from cmd (%s)." %
+                       (attempt, type(e).__name__, e.message, cmd_summary))
 
-                if attempt == remaining_tries - 1:
-                    raise e
-
+            if attempt >= remaining_tries:
+                raise e
             display(msg)
 
         return return_tuple
