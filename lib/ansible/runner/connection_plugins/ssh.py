@@ -16,6 +16,7 @@
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 #
 
+import time
 import os
 import re
 import subprocess
@@ -30,9 +31,53 @@ import gettext
 import pty
 from hashlib import sha1
 import ansible.constants as C
-from ansible.callbacks import vvv
+from ansible.callbacks import vvv, vv, display
 from ansible import errors
 from ansible import utils
+
+
+def retry(func):
+    print ("Starting %s" % func.__name__)
+    def retry_exec(self, *args, **kwargs):
+        """ Wrapper around exec_command, put_file or fetch_file to retry in the case of an ssh
+            failure
+
+            Will retry if:
+            * an exception is caught
+            * ssh returns 255
+        """
+        cmd_summary = "%s %s..." % (args[0], str(kwargs)[:200])
+        remaining_tries = C.ANSIBLE_SSH_RETRIES+1
+        for attempt in xrange(1, remaining_tries+1):
+            pause = 2 ** attempt - 1
+
+            if pause > 30:
+                pause = 30
+            time.sleep(pause)
+
+            try:
+                return_tuple = func(self, *args, **kwargs)
+
+                # 0 = success
+                # 1-254 = remote command return code
+                # 255 = failure from the ssh command itself
+                if return_tuple[0] != 255:
+                    break
+                else:
+                    msg = ('[WARNING] ssh_retry [%s/%s]: ssh return code is 255. cmd (%s)' %
+                           (attempt, remaining_tries, cmd_summary))
+
+            except (errors.AnsibleConnectionFailed, errors.AnsibleConnectionTimeout, Exception) as e:
+                msg = ("[WARNING] ssh_retry [%s/%s]: Caught %s (%s) from cmd (%s)." %
+                       (attempt, remaining_tries, type(e).__name__, e.message, cmd_summary))
+
+                if attempt == remaining_tries - 1:
+                    raise e
+
+            display(msg)
+
+        return return_tuple
+    return retry_exec
 
 
 class Connection(object):
@@ -153,7 +198,7 @@ class Connection(object):
                 stdin.write(indata)
                 stdin.close()
             except:
-                raise errors.AnsibleError('SSH Error: data could not be sent to the remote host. Make sure this host can be reached over ssh')
+                raise errors.AnsibleConnectionFailed('SSH Error: data could not be sent to the remote host. Make sure this host can be reached over ssh')
         # Read stdout/stderr from process
         while True:
             rfd, wfd, efd = select.select(rpipes, [], rpipes, 1)
@@ -253,9 +298,9 @@ class Connection(object):
             vvv("EXEC previous known host file not found for %s" % host)
         return True
 
+    @retry
     def exec_command(self, cmd, tmp_path, become_user=None, sudoable=False, executable='/bin/sh', in_data=None):
         ''' run a command on the remote host '''
-
         if sudoable and self.runner.become and self.runner.become_method not in self.become_methods_supported:
             raise errors.AnsibleError("Internal Error: this module does not support running commands via %s" % self.runner.become_method)
 
@@ -330,7 +375,7 @@ class Connection(object):
                 if p.stderr in rfd:
                     chunk = p.stderr.read()
                     if not chunk:
-                        raise errors.AnsibleError('ssh connection closed waiting for a privilege escalation password prompt')
+                        raise errors.AnsibleConnectionTimeout('ssh connection closed waiting for a privilege escalation password prompt')
                     become_errput += chunk
                     incorrect_password = gettext.dgettext(
                         "become", "Sorry, try again.")
@@ -342,13 +387,13 @@ class Connection(object):
                 if p.stdout in rfd:
                     chunk = p.stdout.read()
                     if not chunk:
-                        raise errors.AnsibleError('ssh connection closed waiting for %s password prompt' % self.runner.become_method)
+                        raise errors.AnsibleConnectionTimeout('ssh connection closed waiting for %s password prompt' % self.runner.become_method)
                     become_output += chunk
 
                 if not rfd:
                     # timeout. wrap up process communication
                     stdout = p.communicate()
-                    raise errors.AnsibleError('ssh connection error while waiting for %s password prompt' % self.runner.become_method)
+                    raise errors.AnsibleConnectionTimeout('ssh connection error while waiting for %s password prompt' % self.runner.become_method)
 
             if success_key in become_output:
                 no_prompt_out += become_output
@@ -373,7 +418,7 @@ class Connection(object):
         if p.returncode != 0 and controlpersisterror:
             raise errors.AnsibleError('using -c ssh on certain older ssh versions may not support ControlPersist, set ANSIBLE_SSH_ARGS="" (or ssh_args in [ssh_connection] section of the config file) before running again')
         if p.returncode == 255 and (in_data or self.runner.module_name == 'raw'):
-            raise errors.AnsibleError('SSH Error: data could not be sent to the remote host. Make sure this host can be reached over ssh')
+            raise errors.AnsibleConnectionFailed('SSH Error: data could not be sent to the remote host. Make sure this host can be reached over ssh')
         if p.returncode == 255:
             ip = None
             port = None
@@ -394,10 +439,11 @@ class Connection(object):
             lines.append(
                 'It is sometimes useful to re-run the command using -vvvv, '
                 'which prints SSH debug output to help diagnose the issue.')
-            raise errors.AnsibleError('SSH Error: %s' % '\n'.join(lines))
+            raise errors.AnsibleConnectionFailed('SSH Error: %s' % '\n'.join(lines))
 
         return (p.returncode, '', no_prompt_out + stdout, no_prompt_err + stderr)
 
+    @retry
     def put_file(self, in_path, out_path):
         ''' transfer a file from local to remote '''
         vvv("PUT %s TO %s" % (in_path, out_path), host=self.host)
@@ -425,7 +471,9 @@ class Connection(object):
 
         if returncode != 0:
             raise errors.AnsibleError("failed to transfer file to %s:\n%s\n%s" % (out_path, stdout, stderr))
+        return (returncode, stdout, stderr)
 
+    @retry
     def fetch_file(self, in_path, out_path):
         ''' fetch a file from remote to local '''
         vvv("FETCH %s TO %s" % (in_path, out_path), host=self.host)
@@ -450,6 +498,7 @@ class Connection(object):
 
         if p.returncode != 0:
             raise errors.AnsibleError("failed to transfer file from %s:\n%s\n%s" % (in_path, stdout, stderr))
+        return (0, stdout, stderr)
 
     def close(self):
         ''' not applicable since we're executing openssh binaries '''
