@@ -34,6 +34,7 @@ import ansible.constants as C
 from ansible.callbacks import vvv, vv, display
 from ansible import errors
 from ansible import utils
+from threading import Timer
 
 
 def retry(func):
@@ -76,6 +77,13 @@ def retry(func):
 
         return return_tuple
     return retry_exec
+
+
+def killer(process):
+    """ Kills subprocess if it doesn't respond on stdin sending data"""
+    if process:
+        process.kill()
+        raise errors.AnsibleConnectionFailed('SSH Error: thread timeout')
 
 
 class Connection(object):
@@ -192,11 +200,14 @@ class Connection(object):
         stderr = ''
         rpipes = [p.stdout, p.stderr]
         if indata:
+            timer = Timer(2.0+C.DEFAULT_TIMEOUT, killer, args=[p])
             try:
+                timer.start()
                 stdin.write(indata)
                 stdin.close()
             except:
                 raise errors.AnsibleConnectionFailed('SSH Error: data could not be sent to the remote host. Make sure this host can be reached over ssh')
+            timer.cancel()
         # Read stdout/stderr from process
         while True:
             rfd, wfd, efd = select.select(rpipes, [], rpipes, 1)
