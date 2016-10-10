@@ -209,8 +209,13 @@ class Connection(object):
                 raise errors.AnsibleConnectionFailed('SSH Error: data could not be sent to the remote host. Make sure this host can be reached over ssh')
             timer.cancel()
         # Read stdout/stderr from process
+        start = time.time()
         while True:
             rfd, wfd, efd = select.select(rpipes, [], rpipes, 1)
+            if C.ANSIBLE_SSH_TIMEOUT > 0 and time.time()-start > 2.0 + C.ANSIBLE_SSH_TIMEOUT:
+                stdin.close()
+                p.kill()
+                raise errors.AnsibleConnectionTimeout("SSH Timeout: no answer received within %d seconds" % C.ANSIBLE_SSH_TIMEOUT)
 
             # fail early if the become password is wrong
             if self.runner.become and sudoable:
